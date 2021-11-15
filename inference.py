@@ -10,6 +10,7 @@ import sys
 from typing import Callable, List, Dict, NoReturn, Tuple
 
 import numpy as np
+import pandas as pd
 
 from datasets import (
     load_metric,
@@ -33,7 +34,7 @@ from transformers import (
 
 from utils_qa import postprocess_qa_predictions_inf, check_no_error
 from trainer_qa import QuestionAnsweringTrainer
-from elastic_retrieval import SparseRetrieval
+#from elastic_retrieval import SparseRetrieval
 
 from arguments import (
     ModelArguments,
@@ -117,14 +118,23 @@ def run_sparse_retrieval(
 ) -> DatasetDict:
 
     # Query에 맞는 Passage들을 Retrieval 합니다.
-    retrieval = SparseRetrieval()
+    ##retrieval = SparseRetrieval()
 
-    df = retrieval.retrieve_ES(
-        datasets["validation"],
-        topk=data_args.top_k_retrieval,
-        ner_path="./inference_tagged.csv",
-    )
+    # df = retrieval.retrieve_ES(
+    #     datasets["validation"],
+    #     topk=data_args.top_k_retrieval,
+    #     ner_path="./inference_tagged.csv",
+    # )
 
+    # dataframe을 불러옵니다
+    df = pd.read_csv('./abc.csv')
+    #df['context'].apply(eval)
+    print(df['context'][0])
+    print(df['question'][0])
+    print('---------------------')
+    for i in range(len(df)):
+        df['context'][i] = [df['context'][i][2:-2]]
+    # df.to_csv('check.csv')
     # test data 에 대해선 정답이 없으므로 id question context 로만 데이터셋이 구성됩니다.
     if training_args.do_predict:
         f = Features(
@@ -185,7 +195,9 @@ def run_mrc(
         test_query = examples["question"]
         test_contexts = examples["context"]
         test_id = examples["id"]
-        topk = len(test_contexts[0])
+        #topk = len(test_contexts[0])
+        print('-----------------------------------------')
+        topk = 1
         assert topk == data_args.top_k_retrieval, "topk not correct"
         tq_final = []
         tc_final = []
@@ -195,7 +207,13 @@ def run_mrc(
             temp_i = [test_id[i] for _ in range(topk)]
             tq_final.extend(temp_q)
             ti_final.extend(temp_i)
-            tc_final.extend(test_contexts[i])
+            #a = ''.join(test_contexts[i])
+            #a = a[2:-2]
+            #tc_final.append(a)
+            tc_final.extend(test_contexts[i][0])
+        print(len(tq_final))
+        print(len(ti_final))
+        print(len(tc_final))
         assert len(tq_final) == len(ti_final) and len(tq_final) == len(
             tc_final
         ), "final list length not correct"
