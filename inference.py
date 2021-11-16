@@ -128,12 +128,15 @@ def run_sparse_retrieval(
 
     # dataframe을 불러옵니다
     df = pd.read_csv('./abc.csv')
-    #df['context'].apply(eval)
-    print(df['context'][0])
-    print(df['question'][0])
-    print('---------------------')
+    #df['context'] = df['context'].apply(eval)
     for i in range(len(df)):
         df['context'][i] = [df['context'][i][2:-2]]
+    print(df['context'][0])
+    print(type(df['context'][0]))
+    print(df['question'][0])
+    print('---------------------')
+    
+
     # df.to_csv('check.csv')
     # test data 에 대해선 정답이 없으므로 id question context 로만 데이터셋이 구성됩니다.
     if training_args.do_predict:
@@ -210,7 +213,7 @@ def run_mrc(
             #a = ''.join(test_contexts[i])
             #a = a[2:-2]
             #tc_final.append(a)
-            tc_final.extend(test_contexts[i][0])
+            tc_final.extend(test_contexts[i])
         print(len(tq_final))
         print(len(ti_final))
         print(len(tc_final))
