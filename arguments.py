@@ -35,7 +35,7 @@ class DataTrainingArguments:
     """
 
     dataset_name: Optional[str] = field(
-        default="../data/train_dataset/",
+        default="../data/mrc.csv",
         metadata={"help": "The name of the dataset to use."},
     )
     overwrite_cache: bool = field(
@@ -43,7 +43,7 @@ class DataTrainingArguments:
         metadata={"help": "Overwrite the cached training and evaluation sets"},
     )
     preprocessing_num_workers: Optional[int] = field(
-        default=None,
+        default=4,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     max_seq_length: int = field(
@@ -74,25 +74,9 @@ class DataTrainingArguments:
             "and end predictions are not conditioned on one another."
         },
     )
-    eval_retrieval: bool = field(
-        default=True,
-        metadata={"help": "Whether to run passage retrieval using sparse embedding."},
-    )
-    num_clusters: int = field(
-        default=64, metadata={"help": "Define how many clusters to use for faiss."}
-    )
     top_k_retrieval: int = field(
         default=1,
         metadata={
             "help": "Define how many top-k passages to retrieve based on similarity."
         },
-    )
-    ng_top_k_retrieval: int = field(
-        default=5,
-        metadata={
-            "help": "Define how many top-k passages to include in negative samples"
-        },
-    )
-    use_faiss: bool = field(
-        default=False, metadata={"help": "Whether to build with faiss"}
     )

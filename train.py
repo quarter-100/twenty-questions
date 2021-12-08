@@ -42,12 +42,24 @@ from arguments import (
     ModelArguments,
     DataTrainingArguments,
 )
-
-from elastic_retrieval import SparseRetrieval
 import wandb
-from elastic_setting import preprocess
+import re
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+def preprocess(text):
+    text = re.sub(r"\n", " ", text)
+    text = re.sub(r"\\n", " ", text)
+    # text = re.sub(r"\'", "", text) -> 이거 풀면 성능 하락
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"#", " ", text)
+    text = re.sub(
+        r"[^a-zA-Z0-9가-힣ㄱ-ㅎㅏ-ㅣぁ-ゔァ-ヴー々〆〤一-龥<>()\s\.\?!》《≪≫\'<>〈〉:‘’%,『』「」＜＞・\"-“”∧]",
+        "",
+        text,
+    )
+    return text
 
 
 def main():
@@ -59,132 +71,106 @@ def main():
     print(model_args.model_name_or_path)
 
     # [참고] argument를 manual하게 수정하고 싶은 경우에 아래와 같은 방식을 사용할 수 있습니다
-    # training_args.per_device_train_batch_size = 4
-    # print(training_args.per_device_train_batch_size)
-    # 5-fold 데이터를 불러옵니다.
-    fold1 = pd.read_csv("./fold1.csv")
-    fold2 = pd.read_csv("./fold2.csv")
-    fold3 = pd.read_csv("./fold3.csv")
-    fold4 = pd.read_csv("./fold4.csv")
-    fold5 = pd.read_csv("./fold5.csv")
+    training_args = TrainingArguments(
+        do_train=True,
+        output_dir="./models/mrc",
+        overwrite_output_dir=True,
+        evaluation_strategy="steps",
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        gradient_accumulation_steps=2,
+        learning_rate=5e-5,
+        num_train_epochs=5,
+        warmup_ratio=0.1,
+        logging_strategy="steps",
+        logging_steps=100,
+        save_strategy="steps",
+        save_steps=1500,
+        save_total_limit=1,
+        seed=42,
+        eval_steps=1500,
+        metric_for_best_model="exact_match",
+        load_best_model_at_end=True,
+        fp16=True,
+        dataloader_num_workers=2,
+    )
+    print(f"model is from {model_args.model_name_or_path}")
+    print(f"data is from {data_args.dataset_name}")
 
-    fold1["answers"] = fold1["answers"].apply(eval)
-    fold2["answers"] = fold2["answers"].apply(eval)
-    fold3["answers"] = fold3["answers"].apply(eval)
-    fold4["answers"] = fold4["answers"].apply(eval)
-    fold5["answers"] = fold5["answers"].apply(eval)
+    # 모델을 초기화하기 전에 난수를 고정합니다.
+    set_seed(training_args.seed)
 
-    folds = [fold1, fold2, fold3, fold4, fold5]
+    # logging 설정
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -    %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    
+    # verbosity 설정 : Transformers logger의 정보로 사용합니다 (on main process only)
+    logger.info("Training/evaluation parameters %s", training_args)
 
-    # range안의 숫자를 조절하여 특정 fold만 학습할 수 있습니다. fold로 들어갈 수 있는 숫자는 1~5입니다.(range(1,6))
-    for fold in range(1, 6):
-        training_args = TrainingArguments(
-            do_train=True,
-            output_dir="./models/train_dataset_ng5_fold" + str(fold),
-            overwrite_output_dir=True,
-            evaluation_strategy="steps",
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=16,
-            gradient_accumulation_steps=2,
-            learning_rate=1e-5,
-            num_train_epochs=8,
-            warmup_ratio=0.1,
-            logging_strategy="steps",
-            logging_steps=100,
-            save_strategy="steps",
-            save_steps=300,
-            save_total_limit=1,
-            seed=42,
-            eval_steps=300,
-            metric_for_best_model="exact_match",
-            load_best_model_at_end=True,
+    f = Features(
+        {
+            "id": Value(dtype="int32", id=None),
+            "context": Value(dtype="string", id=None),
+            "question": Value(dtype="string", id=None),
+            "answer": Value(dtype="string", id=None),
+            "answer_start": Value(dtype="int32", id=None),
+        }
+    )
+    
+    df = pd.read_csv(data_args.dataset_name)
+    train_df = df.sample(frac = 0.8)
+    valid_df = df.drop(train_df.index)
+    datasets = DatasetDict(
+        {
+            "train": Dataset.from_pandas(train_df, features=f),
+            "validation": Dataset.from_pandas(valid_df, features=f),
+        }
+    )
+    
+    print(datasets)
+
+    # AutoConfig를 이용하여 pretrained model 과 tokenizer를 불러옵니다.
+    # argument로 원하는 모델 이름을 설정하면 옵션을 바꿀 수 있습니다.
+    config = AutoConfig.from_pretrained(
+        model_args.config_name
+        if model_args.config_name is not None
+        else model_args.model_name_or_path,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name
+        if model_args.tokenizer_name is not None
+        else model_args.model_name_or_path,
+        # 'use_fast' argument를 True로 설정할 경우 rust로 구현된 tokenizer를 사용할 수 있습니다.
+        # False로 설정할 경우 python으로 구현된 tokenizer를 사용할 수 있으며,
+        # rust version이 비교적 속도가 빠릅니다.
+        use_fast=True,
+    )
+    model = AutoModelForQuestionAnswering.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+    )
+    print(
+        type(training_args),
+        type(model_args),
+        type(datasets),
+        type(tokenizer),
+        type(model),
+    )
+
+    # do_train mrc model 혹은 do_eval mrc model
+    if training_args.do_train or training_args.do_eval:
+        run = wandb.init(
+            project="final project",
+            entity="quarter100",
+            name='mrc',
+            group="train"
         )
-        print(f"model is from {model_args.model_name_or_path}")
-        print(f"data is from {data_args.dataset_name}")
-
-        # 모델을 초기화하기 전에 난수를 고정합니다.
-        set_seed(training_args.seed)
-
-        # logging 설정
-        logging.basicConfig(
-            format="%(asctime)s - %(levelname)s - %(name)s -    %(message)s",
-            datefmt="%m/%d/%Y %H:%M:%S",
-            handlers=[logging.StreamHandler(sys.stdout)],
-        )
-
-        # verbosity 설정 : Transformers logger의 정보로 사용합니다 (on main process only)
-        logger.info("Training/evaluation parameters %s", training_args)
-
-        df = pd.concat([folds[i] for i in range(5) if i + 1 != fold], ignore_index=True)
-
-        f = Features(
-            {
-                "answers": Sequence(
-                    feature={
-                        "text": Value(dtype="string", id=None),
-                        "answer_start": Value(dtype="int32", id=None),
-                    },
-                    length=-1,
-                    id=None,
-                ),
-                "context": Value(dtype="string", id=None),
-                "id": Value(dtype="string", id=None),
-                "question": Value(dtype="string", id=None),
-            }
-        )
-        datasets = DatasetDict(
-            {
-                "train": Dataset.from_pandas(df, features=f),
-                "validation": Dataset.from_pandas(folds[fold - 1], features=f),
-            }
-        )
-
-        """
-        # datasets = load_from_disk(data_args.dataset_name)
-        datasets.save_to_disk("./fold_dataset/")
-        datasets = load_from_disk("./fold_dataset/")
-        """
-        print(datasets)
-
-        # AutoConfig를 이용하여 pretrained model 과 tokenizer를 불러옵니다.
-        # argument로 원하는 모델 이름을 설정하면 옵션을 바꿀 수 있습니다.
-        config = AutoConfig.from_pretrained(
-            model_args.config_name
-            if model_args.config_name is not None
-            else model_args.model_name_or_path,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_args.tokenizer_name
-            if model_args.tokenizer_name is not None
-            else model_args.model_name_or_path,
-            # 'use_fast' argument를 True로 설정할 경우 rust로 구현된 tokenizer를 사용할 수 있습니다.
-            # False로 설정할 경우 python으로 구현된 tokenizer를 사용할 수 있으며,
-            # rust version이 비교적 속도가 빠릅니다.
-            use_fast=True,
-        )
-        model = AutoModelForQuestionAnswering.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-        )
-        print(
-            type(training_args),
-            type(model_args),
-            type(datasets),
-            type(tokenizer),
-            type(model),
-        )
-
-        # do_train mrc model 혹은 do_eval mrc model
-        if training_args.do_train or training_args.do_eval:
-            run = wandb.init(
-                project="mrc",
-                entity="quarter100",
-                name="fold" + str(fold),
-                group="ng5only_fold",
-            )
-            run_mrc(data_args, training_args, model_args, datasets, tokenizer, model)
-            run.finish()
+        run_mrc(data_args, training_args, model_args, datasets, tokenizer, model)
+        run.finish()
 
 
 def run_mrc(
@@ -203,9 +189,10 @@ def run_mrc(
     else:
         column_names = datasets["validation"].column_names
 
-    question_column_name = "question" if "question" in column_names else column_names[0]
+    question_column_name = "question" if "question" in column_names else column_names[2]
     context_column_name = "context" if "context" in column_names else column_names[1]
-    answer_column_name = "answers" if "answers" in column_names else column_names[2]
+    answer_column_name = "answer" if "answer" in column_names else column_names[3]
+    answer_start_column_name = "answer_start" if "answer_start" in column_names else column_names[4]
 
     # Padding에 대한 옵션을 설정합니다.
     # (question|context) 혹은 (context|question)로 세팅 가능합니다.
@@ -215,13 +202,6 @@ def run_mrc(
     last_checkpoint, max_seq_length = check_no_error(
         data_args, training_args, datasets, tokenizer
     )
-    """
-    qg_df = pd.read_pickle("../data/delete_qg_sort.pkl")
-    qg_df = qg_df.iloc[1:1200]
-    qg_dataset = Dataset.from_pandas(qg_df)
-    qg_dataset.save_to_disk("../data/qg_dataset/")
-    """
-    ES_retrieval = SparseRetrieval()
 
     # Train preprocessing / 전처리를 진행합니다.
     def prepare_train_features(examples):
@@ -230,9 +210,8 @@ def run_mrc(
         # 원본 데이터 context 전처리 및 그에 따른 answer_position 이동
         for i in range(len(examples[context_column_name])):
             context = examples[context_column_name][i]
-            answer = examples[answer_column_name][i]
-            answer_start = answer["answer_start"][0]
-            answer_text = answer["text"][0]
+            answer_text = examples[answer_column_name][i]
+            answer_start = examples[answer_start_column_name][i]
             answer_end = answer_start + len(answer_text)
             context_pre = context[:answer_start]
             context_post = context[answer_end:]
@@ -240,10 +219,7 @@ def run_mrc(
             context_post = preprocess(context_post)
             new_answer_start = len(context_pre)
             examples[context_column_name][i] = context_pre + answer_text + context_post
-            examples[answer_column_name][i] = {
-                "answer_start": [new_answer_start],
-                "text": [answer_text],
-            }
+            examples[answer_start_column_name][i] = new_answer_start
 
         tokenized_examples = tokenizer(
             examples[question_column_name if pad_on_right else context_column_name],
@@ -276,16 +252,17 @@ def run_mrc(
 
             # 하나의 example이 여러개의 span을 가질 수 있습니다.
             sample_index = sample_mapping[i]
-            answers = examples[answer_column_name][sample_index]
+            answer_text = examples[answer_column_name][sample_index]
+            answer_start = examples[answer_start_column_name][sample_index]
 
             # answer가 없을 경우 cls_index를 answer로 설정합니다(== example에서 정답이 없는 경우 존재할 수 있음).
-            if len(answers["answer_start"]) == 0:
+            if answer_start<0:
                 tokenized_examples["start_positions"].append(cls_index)
                 tokenized_examples["end_positions"].append(cls_index)
             else:
                 # text에서 정답의 Start/end character index
-                start_char = answers["answer_start"][0]
-                end_char = start_char + len(answers["text"][0])
+                start_char = answer_start
+                end_char = start_char + len(answer_text)
 
                 # text에서 current span의 Start token index
                 token_start_index = 0
@@ -318,91 +295,20 @@ def run_mrc(
                     tokenized_examples["end_positions"].append(token_end_index + 1)
         return tokenized_examples
 
-    # negative sampling
-    def prepare_train_features_ng(examples):
-        x = Dataset.from_dict(examples)
-        negative_df = ES_retrieval.retrieve_ES(
-            x, topk=data_args.ng_top_k_retrieval, ner_path="./train_tagged.csv"
-        )
-        negative_query = negative_df["question"]
-        negative_contexts = negative_df["context"]
-        negative_gt_contexts = negative_df["original_context"]
-        nq_final = []
-        nc_final = []
-        for i in range(len(negative_query)):
-            temp_q = [
-                negative_query[i] for _ in range((data_args.ng_top_k_retrieval - 1))
-            ]
-            nq_final.extend(temp_q)
-            if negative_gt_contexts[i] in negative_contexts[i]:
-                negative_contexts[i].remove(negative_gt_contexts[i])
-                temp_c = negative_contexts[i]
-                nc_final.extend(temp_c)
-            else:
-                temp_c = negative_contexts[i][: (data_args.ng_top_k_retrieval - 1)]
-                nc_final.extend(temp_c)
-        assert len(nq_final) == len(
-            nc_final
-        ), f"nq_final length {len(nq_final)} should be same as nc_final {len(nc_final)}"
-
-        tokenized_examples_ng = tokenizer(
-            nq_final if pad_on_right else nc_final,
-            nc_final if pad_on_right else nq_final,
-            truncation="only_second" if pad_on_right else "only_first",
-            max_length=max_seq_length,
-            stride=data_args.doc_stride,
-            return_overflowing_tokens=True,
-            return_offsets_mapping=True,
-            return_token_type_ids=False,  # roberta모델을 사용할 경우 False, bert를 사용할 경우 True로 표기해야합니다.
-            padding="max_length" if data_args.pad_to_max_length else False,
-        )
-        tokenized_examples_ng.pop("overflow_to_sample_mapping")
-        tokenized_examples_ng.pop("offset_mapping")
-        tokenized_examples_ng["start_positions"] = []
-        tokenized_examples_ng["end_positions"] = []
-
-        for i in range(len(tokenized_examples_ng["input_ids"])):
-            tokenized_examples_ng["start_positions"].append(0)
-            tokenized_examples_ng["end_positions"].append(0)
-        return tokenized_examples_ng
-
     if training_args.do_train:
         if "train" not in datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = datasets["train"]
 
         # dataset에서 train feature를 생성합니다.
-        train_dataset_ps = train_dataset.map(
+        train_dataset = train_dataset.map(
             prepare_train_features,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=data_args.overwrite_cache,
         )
-        train_dataset_ng = train_dataset.map(
-            prepare_train_features_ng,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=data_args.overwrite_cache,
-        )
-        """
-        qg_dataset = load_from_disk("../data/qg_dataset/")
-        train_dataset_qg = qg_dataset.map(
-            prepare_train_features,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=qg_dataset.column_names,
-            load_from_cache_file=data_args.overwrite_cache,
-        )
-        """
-        train_dataset = concatenate_datasets(
-            [
-                train_dataset_ps.flatten_indices(),
-                train_dataset_ng.flatten_indices(),
-                #train_dataset_qg.flatten_indices(),
-            ]
-        )
+        
     print("train_dataset length : ", len(train_dataset))
 
     # Validation preprocessing
@@ -443,27 +349,33 @@ def run_mrc(
                 for k, o in enumerate(tokenized_examples["offset_mapping"][i])
             ]
         return tokenized_examples
-
-    if training_args.do_eval:
-        eval_dataset = datasets["validation"]
-        for i in range(len(eval_dataset[context_column_name])):
-            context = eval_dataset[context_column_name][i]
-            answer = eval_dataset[answer_column_name][i]
-            answer_start = answer["answer_start"][0]
-            answer_text = answer["text"][0]
+    
+    def prepare_validation_preprocess(examples):
+        for i in range(len(examples[context_column_name])):
+            context = examples[context_column_name][i]
+            answer_text = examples[answer_column_name][i]
+            answer_start = examples[answer_start_column_name][i]
             answer_end = answer_start + len(answer_text)
             context_pre = context[:answer_start]
             context_post = context[answer_end:]
             context_pre = preprocess(context_pre)
             context_post = preprocess(context_post)
             new_answer_start = len(context_pre)
-            eval_dataset[context_column_name][i] = (
-                context_pre + answer_text + context_post
-            )
-            eval_dataset[answer_column_name][i] = {
-                "answer_start": [new_answer_start],
-                "text": [answer_text],
-            }
+            examples[context_column_name][i] = context_pre + answer_text + context_post
+            examples[answer_start_column_name][i] = new_answer_start
+        return examples
+
+    if training_args.do_eval:
+        if "validation" not in datasets:
+            raise ValueError("--do_eval requires a validation dataset")
+        eval_dataset = datasets["validation"]
+        eval_dataset = eval_dataset.map(
+            prepare_validation_preprocess,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=None,
+            load_from_cache_file=data_args.overwrite_cache,
+        )
 
         # Validation Feature 생성
         eval_dataset_tokenized = eval_dataset.map(
@@ -473,7 +385,7 @@ def run_mrc(
             remove_columns=column_names,
             load_from_cache_file=data_args.overwrite_cache,
         )
-    print("valid_dataset length : ", len(eval_dataset_tokenized))
+        print("valid_dataset length : ", len(eval_dataset_tokenized))
 
     # Data collator
     # flag가 True이면 이미 max length로 padding된 상태입니다.
@@ -501,7 +413,7 @@ def run_mrc(
 
         elif training_args.do_eval:
             references = [
-                {"id": ex["id"], "answers": ex[answer_column_name]}
+                {"id": ex["id"], "answers": {"text": [ex[answer_column_name]], "answer_start": [ex[answer_start_column_name]]}}
                 for ex in datasets["validation"]
             ]
             return EvalPrediction(

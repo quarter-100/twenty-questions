@@ -366,7 +366,6 @@ def postprocess_qa_predictions_inf(
     examples,
     features,
     predictions: Tuple[np.ndarray, np.ndarray],
-    topk,  # 바꿈!
     version_2_with_negative: bool = False,
     n_best_size: int = 20,
     max_answer_length: int = 30,
@@ -439,36 +438,22 @@ def postprocess_qa_predictions_inf(
         feature_indices = features_per_example[example_index]
 
         min_null_prediction = None
-        # 바꿈!
-        prelim_predictions = collections.defaultdict(list)
+        prelim_predictions = []
 
         # 현재 example에 대한 모든 feature 생성합니다.
         for feature_index in feature_indices:
             # 각 featureure에 대한 모든 prediction을 가져옵니다.
             start_logits = all_start_logits[feature_index]
             end_logits = all_end_logits[feature_index]
-            # softmax로 변환하는 과정
-            start_logits = np.array(start_logits)
-            exp_start = np.exp(start_logits - np.max(start_logits))
-            start_logits = exp_start / exp_start.sum()
-            end_logits = np.array(end_logits)
-            exp_end = np.exp(end_logits - np.max(end_logits))
-            end_logits = exp_end / exp_end.sum()
-
             # logit과 original context의 logit을 mapping합니다.
             offset_mapping = features[feature_index]["offset_mapping"]
-            # 바꿈!
-            sample_mapping = (
-                features[feature_index]["overflow_to_sample_mapping"] % topk
-            )
-
             # Optional : `token_is_max_context`, 제공되는 경우 현재 기능에서 사용할 수 있는 max context가 없는 answer를 제거합니다
             token_is_max_context = features[feature_index].get(
                 "token_is_max_context", None
             )
 
             # minimum null prediction을 업데이트 합니다.
-            feature_null_score = start_logits[0] * end_logits[0]
+            feature_null_score = start_logits[0] + end_logits[0]
             if (
                 min_null_prediction is None
                 or min_null_prediction["score"] > feature_null_score
@@ -509,16 +494,13 @@ def postprocess_qa_predictions_inf(
                         and not token_is_max_context.get(str(start_index), False)
                     ):
                         continue
-                    # 바꿈!
-                    prelim_predictions[sample_mapping].append(
+                    prelim_predictions.append(
                         {
                             "offsets": (
                                 offset_mapping[start_index][0],
                                 offset_mapping[end_index][1],
                             ),
-                            # "score": start_logits[start_index] + end_logits[end_index],
-                            # 확률로 바꿨으니 이제 곱해야지!!
-                            "score": start_logits[start_index] * end_logits[end_index],
+                            "score": start_logits[start_index] + end_logits[end_index],
                             "start_logit": start_logits[start_index],
                             "end_logit": end_logits[end_index],
                         }
@@ -528,24 +510,12 @@ def postprocess_qa_predictions_inf(
             # minimum null prediction을 추가합니다.
             prelim_predictions.append(min_null_prediction)
             null_score = min_null_prediction["score"]
-
+        
+        prelim_predictions.append(min_null_prediction)
         # 가장 좋은 `n_best_size` predictions만 유지합니다.
-        # offset을 사용하여 original context에서 answer text를 수집합니다.
-        # 바꿈!
-        for sample in prelim_predictions:
-            prelim_predictions[sample] = sorted(
-                prelim_predictions[sample], key=lambda x: x["score"], reverse=True
-            )[:n_best_size]
-            context = example["context"][sample]
-            for pred in prelim_predictions[sample]:
-                offsets = pred.pop("offsets")
-                pred["text"] = context[offsets[0] : offsets[1]]
-        predictions = []
-        for sample in prelim_predictions:
-            predictions.extend(prelim_predictions[sample])
-        predictions = sorted(predictions, key=lambda x: x["score"], reverse=True)[
-            :n_best_size
-        ]
+        predictions = sorted(
+            prelim_predictions, key=lambda x: x["score"], reverse=True
+        )[:n_best_size]
 
         # 낮은 점수로 인해 제거된 경우 minimum null prediction을 다시 추가합니다.
         if version_2_with_negative and not any(
@@ -553,13 +523,22 @@ def postprocess_qa_predictions_inf(
         ):
             predictions.append(min_null_prediction)
 
+        # offset을 사용하여 original context에서 answer text를 수집합니다.
+        context = example["context"]
+        for pred in predictions:
+            offsets = pred.pop("offsets")
+            if offsets[0]==0 and offsets[1]==0:
+                pred["text"] = "No Answer"
+                continue
+            pred["text"] = context[offsets[0] : offsets[1]]
+
         # rare edge case에는 null이 아닌 예측이 하나도 없으며 failure를 피하기 위해 fake prediction을 만듭니다.
         if len(predictions) == 0 or (
-            len(predictions) == 1 and predictions[0]["text"] == ""
+            len(predictions) == 1 and predictions[0]["text"] == "No Answer"
         ):
 
             predictions.insert(
-                0, {"text": "empty", "start_logit": 0.0, "end_logit": 0.0, "score": 0.0}
+                0, {"text": "No Answer", "start_logit": 0.0, "end_logit": 0.0, "score": 0.0}
             )
 
         # 모든 점수의 소프트맥스를 계산합니다(we do it with numpy to stay independent from torch/tf in this file, using the LogSumExp trick).
